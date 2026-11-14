@@ -16,6 +16,7 @@ import re
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 ENDPOINT = os.environ.get("GH_MCP_URL", "https://api.githubcopilot.com/mcp/")
@@ -32,12 +33,19 @@ def rpc(method, params=None, toolsets="default", timeout=120):
     if not token:
         raise McpError("GH_TOKEN is not set. Add it to the cloud environment's variables.")
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}})
-    # The token goes to curl on stdin as a header file, so it never shows in the process list.
-    cmd = ["curl", "-sS", "-m", str(timeout), ENDPOINT, "-H", "@-",
-           "-H", "Content-Type: application/json",
-           "-H", "Accept: application/json, text/event-stream",
-           "-H", f"X-MCP-Toolsets: {toolsets}", "--data-binary", body]
-    proc = subprocess.run(cmd, input=f"Authorization: Bearer {token}\n", capture_output=True, text=True)
+    # The body goes in a temporary file, not on the command line: a commit of several source files is larger
+    # than the operating system allows one argument to be. The token goes to curl on stdin as a header file,
+    # so it never shows in the process list.
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+        f.write(body)
+    try:
+        cmd = ["curl", "-sS", "-m", str(timeout), ENDPOINT, "-H", "@-",
+               "-H", "Content-Type: application/json",
+               "-H", "Accept: application/json, text/event-stream",
+               "-H", f"X-MCP-Toolsets: {toolsets}", "--data-binary", f"@{f.name}"]
+        proc = subprocess.run(cmd, input=f"Authorization: Bearer {token}\n", capture_output=True, text=True)
+    finally:
+        os.unlink(f.name)
     if proc.returncode != 0:
         raise McpError(f"curl failed ({proc.returncode}): {proc.stderr.strip()[:300]}")
     out = proc.stdout
