@@ -5,6 +5,9 @@ Built for Claude Code cloud sessions, where github.com goes through a proxy that
 serves repos attached with the Claude GitHub App. GitHub's MCP server lives on a different
 host (api.githubcopilot.com), so a personal access token in GH_TOKEN reaches the repo there.
 
+The tool has no default repo. Name one with --repo, with $GH_REPO, or once per session with
+`gh_mcp.py use OWNER/NAME`, which saves it in ~/.gh-mcp-repo.
+
 Standard library only; HTTP goes through curl so the session's proxy settings apply.
 See README.md next to this file for setup, commands and limits.
 """
@@ -20,8 +23,9 @@ import tempfile
 import time
 
 ENDPOINT = os.environ.get("GH_MCP_URL", "https://api.githubcopilot.com/mcp/")
-DEFAULT_REPO = os.environ.get("GH_REPO", "kaizenithal/universe-godot")
-SKIP_DIRS = {"bin", "obj", ".godot", ".idea", ".vs"}
+REPO_FILE = os.path.expanduser("~/.gh-mcp-repo")
+# Folder names `ls -r` and `pull` leave out, e.g. GH_SKIP_DIRS=node_modules,dist. Nothing is skipped by default.
+SKIP_DIRS = {d.strip() for d in os.environ.get("GH_SKIP_DIRS", "").split(",") if d.strip()}
 
 
 class McpError(RuntimeError):
@@ -82,10 +86,46 @@ def text_json(content):
 
 
 def split_repo(repo):
-    owner, _, name = repo.partition("/")
-    if not owner or not name:
+    owner, _, name = (repo or "").partition("/")
+    if not owner or not name or "/" in name:
         raise McpError(f"repo must be owner/name, got {repo!r}")
     return {"owner": owner, "repo": name}
+
+
+def saved_repo():
+    try:
+        with open(REPO_FILE, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def resolve_repo(flag):
+    """--repo wins, then $GH_REPO, then the repo saved by `use`. There is deliberately no built-in default:
+    a tool shared between projects must never guess which repo to write to."""
+    repo = flag or os.environ.get("GH_REPO") or saved_repo()
+    if not repo:
+        raise McpError("no repo chosen. Run `gh_mcp.py use OWNER/NAME` once, or pass --repo OWNER/NAME, or set GH_REPO.")
+    split_repo(repo)
+    return repo
+
+
+def skip_set(a):
+    if a.all:
+        return set()
+    return SKIP_DIRS | {d.strip() for d in (a.skip or "").split(",") if d.strip()}
+
+
+def cmd_use(a):
+    split_repo(a.name)
+    list_dir(a.name, "/")  # fails here, not later, if the token cannot read the repo
+    with open(REPO_FILE, "w", encoding="utf-8") as fh:
+        fh.write(a.name + "\n")
+    print(f"using {a.name} (saved in {REPO_FILE})")
+
+
+def cmd_which(a):
+    print(a.repo)
 
 
 # ---------- reading ----------
@@ -131,7 +171,7 @@ def download_large(path, url, sha):
 
 
 def walk(repo, path, ref=None, skip=SKIP_DIRS):
-    """Yield (path, size) for every file under path, skipping generated folders."""
+    """Yield (path, size) for every file under path, leaving out folders named in skip."""
     for item in list_dir(repo, path, ref):
         if item["type"] == "dir":
             if item["name"] in skip:
@@ -145,7 +185,7 @@ def cmd_ls(a):
     paths = a.paths or ["/"]
     for p in paths:
         if a.recursive:
-            for f, size in walk(a.repo, p, a.ref, set() if a.all else SKIP_DIRS):
+            for f, size in walk(a.repo, p, a.ref, skip_set(a)):
                 print(f"{size:>9}  {f}")
         else:
             for i in list_dir(a.repo, p, a.ref):
@@ -159,7 +199,7 @@ def cmd_cat(a):
 def cmd_pull(a):
     """Copy files or folders from the repo into a local directory, keeping their paths."""
     out = os.path.abspath(a.out)
-    skip = set() if a.all else SKIP_DIRS
+    skip = skip_set(a)
     n, failed = 0, []
     for p in a.paths:
         try:
@@ -278,12 +318,18 @@ def cmd_call(a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--repo", default=DEFAULT_REPO, help=f"owner/name (default {DEFAULT_REPO}, or $GH_REPO)")
+    p.add_argument("--repo", help="owner/name. Otherwise $GH_REPO, otherwise the repo saved by `use`")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("use", help="choose the repo for this session and check the token can read it")
+    s.add_argument("name", help="owner/name"); s.set_defaults(fn=cmd_use)
+
+    s = sub.add_parser("which", help="print the repo commands will act on"); s.set_defaults(fn=cmd_which)
 
     s = sub.add_parser("ls", help="list a folder (-r: every file below it)")
     s.add_argument("paths", nargs="*"); s.add_argument("-r", "--recursive", action="store_true")
-    s.add_argument("--all", action="store_true", help="include bin/obj/.godot/.idea"); s.add_argument("--ref")
+    s.add_argument("--all", action="store_true", help="ignore --skip and $GH_SKIP_DIRS"); s.add_argument("--ref")
+    s.add_argument("--skip", help="comma-separated folder names to leave out, added to $GH_SKIP_DIRS")
     s.set_defaults(fn=cmd_ls)
 
     s = sub.add_parser("cat", help="print one file"); s.add_argument("path"); s.add_argument("--ref")
@@ -291,7 +337,8 @@ def main():
 
     s = sub.add_parser("pull", help="copy files/folders into a local dir")
     s.add_argument("paths", nargs="+"); s.add_argument("-o", "--out", default=".")
-    s.add_argument("--all", action="store_true", help="include bin/obj/.godot/.idea"); s.add_argument("--ref")
+    s.add_argument("--all", action="store_true", help="ignore --skip and $GH_SKIP_DIRS"); s.add_argument("--ref")
+    s.add_argument("--skip", help="comma-separated folder names to leave out, added to $GH_SKIP_DIRS")
     s.add_argument("--missing-only", action="store_true", help="skip files that already exist locally")
     s.set_defaults(fn=cmd_pull)
 
@@ -326,6 +373,8 @@ def main():
 
     a = p.parse_args()
     try:
+        if a.fn is not cmd_use:
+            a.repo = resolve_repo(a.repo)
         a.fn(a)
     except McpError as e:
         print(f"error: {e}", file=sys.stderr)
