@@ -11,8 +11,9 @@ repo as `HANDOFF.md` and replace everything in CAPITALS. Delete sections that do
 1. **GitHub access.** If you are reading this from the start-of-session commands, you have it. The commands and
    their limits are in the README of `kaizenithal/github-mcp-tool`, cloned to `~/gh-mcp`. Use the owner's token
    through that tool. Do not use the built-in GitHub connection unless the owner asks.
-2. **Code.** `python3 ~/gh-mcp/gh_mcp.py pull FOLDERS AND FILES -o ~/work`, then `git init` and commit there, so
-   `git diff` shows what you changed.
+2. **Code.** If the start-of-session commands ran `gh_mcp.py clone`, the repo is in `~/work/NAME` with a local
+   git baseline, so `git diff` shows what you change. Run `python3 ~/gh-mcp/gh_mcp.py sync` to bring it up to
+   date later. Do not fetch files one at a time: API requests are limited per hour and shared by all sessions.
 3. **Toolchain.** HOW TO INSTALL WHAT THE PROJECT NEEDS, AND HOW LONG IT TAKES.
 4. **Check.** BUILD COMMAND AND TEST COMMAND, WITH THE RESULT TO EXPECT (FOR EXAMPLE "120 TESTS PASS").
 5. **Report.** Tell the owner what you found (tests, open pull requests, anything that differs from this file)
