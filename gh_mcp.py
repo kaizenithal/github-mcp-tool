@@ -48,10 +48,19 @@ class RateLimited(McpError):
     """GitHub has stopped answering this token until its hourly allowance renews."""
 
 
-def rpc(method, params=None, toolsets="default", timeout=120):
-    token = os.environ.get("GH_TOKEN")
+def the_token():
+    token = (os.environ.get("GH_TOKEN") or "").strip()
     if not token:
         raise McpError("GH_TOKEN is not set. Add it to the cloud environment's variables.")
+    return token
+
+
+RATE_LIMIT_ADVICE = ("The token's hourly allowance is used up, for every session that shares it. "
+                     "Wait for the time given; retrying spends more of the same allowance.")
+
+
+def rpc(method, params=None, toolsets="default", timeout=120):
+    token = the_token()
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}})
     # The body goes in a temporary file, not on the command line: a commit of several source files is larger
     # than the operating system allows one argument to be. The token goes to curl on stdin as a header file,
@@ -62,13 +71,23 @@ def rpc(method, params=None, toolsets="default", timeout=120):
         cmd = ["curl", "-sS", "-m", str(timeout), ENDPOINT, "-H", "@-",
                "-H", "Content-Type: application/json",
                "-H", "Accept: application/json, text/event-stream",
-               "-H", f"X-MCP-Toolsets: {toolsets}", "--data-binary", f"@{f.name}"]
-        proc = subprocess.run(cmd, input=f"Authorization: Bearer {token}\n", capture_output=True, text=True)
+               "-H", f"X-MCP-Toolsets: {toolsets}", "--data-binary", f"@{f.name}",
+               "-w", "\n%{http_code}"]
+        try:
+            proc = subprocess.run(cmd, input=f"Authorization: Bearer {token}\n", capture_output=True, text=True)
+        except FileNotFoundError:
+            raise McpError("curl is not installed; this tool sends every request with it.")
     finally:
         os.unlink(f.name)
     if proc.returncode != 0:
-        raise McpError(f"curl failed ({proc.returncode}): {proc.stderr.strip()[:300]}")
-    out = proc.stdout
+        raise McpError(f"could not reach {ENDPOINT} (curl {proc.returncode}): {proc.stderr.strip()[:300]}\n"
+                       "If the host is refused, the environment's network must allow api.githubcopilot.com.")
+    out, _, status = proc.stdout.rpartition("\n")
+    if status == "401":
+        raise McpError(f"GitHub rejected the token ({out.strip()[:120]}). It has expired, been revoked, or is not "
+                       "a GitHub token. Only the owner can replace it, in the environment's variables.")
+    if status == "429" or (status == "403" and "rate limit" in out.lower()):
+        raise RateLimited(f"{out.strip()[:200]}\n{RATE_LIMIT_ADVICE}")
     payload = None
     for line in out.splitlines():
         if line.startswith("data: "):
@@ -77,9 +96,12 @@ def rpc(method, params=None, toolsets="default", timeout=120):
         try:
             payload = json.loads(out)
         except ValueError:
-            raise McpError(f"unexpected response: {out[:300]}")
+            raise McpError(f"unexpected response (HTTP {status}): {out[:300]}")
     if "error" in payload:
-        raise McpError(json.dumps(payload["error"])[:500])
+        text = json.dumps(payload["error"])[:500]
+        if "rate limit" in text.lower():
+            raise RateLimited(f"{text}\n{RATE_LIMIT_ADVICE}")
+        raise McpError(text)
     return payload["result"]
 
 
@@ -90,8 +112,7 @@ def call(tool, args, toolsets="default"):
     if res.get("isError"):
         text = " ".join(c.get("text", "") for c in content)[:500]
         if "rate limit" in text.lower():
-            raise RateLimited(f"{tool}: {text}\nThe token's hourly allowance is used up, for every session that "
-                              "shares it. Wait for the time given; retrying spends more of the same allowance.")
+            raise RateLimited(f"{tool}: {text}\n{RATE_LIMIT_ADVICE}")
         raise McpError(f"{tool}: {text}")
     return content
 
@@ -173,9 +194,7 @@ def raw_file(repo, ref, path, sha=None):
 
     ref is a branch name, a commit SHA, or HEAD for the default branch. With sha, the download is
     checked against the file's git checksum and retried if it does not match."""
-    token = os.environ.get("GH_TOKEN")
-    if not token:
-        raise McpError("GH_TOKEN is not set. Add it to the cloud environment's variables.")
+    token = the_token()
     url = f"{RAW}/{repo}/{urllib.parse.quote(ref, safe='')}/{urllib.parse.quote(path.lstrip('/'))}"
     problem = ""
     for attempt in range(3):
@@ -198,11 +217,15 @@ def raw_file(repo, ref, path, sha=None):
     raise McpError(f"{path}: {problem}")
 
 
-def head_commit(repo, ref="main"):
-    """The SHA of the newest commit on a branch (or the SHA itself, checked). One API request."""
-    commits = text_json(call("list_commits", {**split_repo(repo), "sha": ref, "perPage": 1}))
+def head_commit(repo, ref=None):
+    """The SHA of the newest commit on a branch, or on the repo's default branch with no ref.
+    A commit SHA comes back as itself, checked. One API request."""
+    args = {**split_repo(repo), "perPage": 1}
+    if ref:
+        args["sha"] = ref
+    commits = text_json(call("list_commits", args))
     if not isinstance(commits, list) or not commits:
-        raise McpError(f"{ref}: no commits found")
+        raise McpError(f"{ref or 'the default branch'}: no commits found")
     return commits[0]["sha"]
 
 
@@ -215,8 +238,15 @@ def repo_files(repo, commit):
         raise McpError(f"unexpected answer listing the repo: {str(answer)[:200]}")
     if isinstance(answer, dict) and answer.get("truncated"):
         raise McpError("the repo has too many files to list in one request; GitHub cut the list short")
-    return {e["path"]: {"sha": e.get("sha"), "size": e.get("size", 0), "mode": e.get("mode", "")}
-            for e in entries if e.get("type") == "blob"}
+    files = {}
+    for e in entries:
+        if e.get("type") != "blob":
+            continue  # folders, and submodules, which are other repos and are not copied
+        parts = e["path"].split("/")
+        if e["path"].startswith("/") or ".." in parts or ".git" in parts:
+            raise McpError(f"refusing a path that could write outside the folder: {e['path']!r}")
+        files[e["path"]] = {"sha": e.get("sha"), "size": e.get("size", 0), "mode": e.get("mode", "")}
+    return files
 
 
 def under(path, folder):
@@ -230,11 +260,31 @@ def skipped(path, skip):
 
 
 def local_sha(path):
+    """The git checksum of what is at a local path, or None if nothing is. A symbolic link's
+    checksum is that of the path it points to, as in git."""
     try:
+        if os.path.islink(path):
+            return blob_sha(os.readlink(path).encode())
         with open(path, "rb") as fh:
             return blob_sha(fh.read())
     except OSError:
         return None
+
+
+def write_file(dst, data, mode):
+    """Put a fetched file in place: whole or not at all, with git's executable bit and links kept."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.islink(dst) or mode == "120000":
+        if os.path.lexists(dst):
+            os.remove(dst)
+    if mode == "120000":
+        os.symlink(data.decode(), dst)
+        return
+    tmp = f"{dst}.gh-mcp-part"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.chmod(tmp, 0o755 if mode == "100755" else 0o644)
+    os.replace(tmp, dst)
 
 
 def download(repo, commit, wanted, out, quiet=False):
@@ -242,12 +292,7 @@ def download(repo, commit, wanted, out, quiet=False):
     Returns [(path, what went wrong)] for those that could not be fetched."""
     def one(path):
         data = raw_file(repo, commit, path, wanted[path]["sha"])
-        dst = os.path.join(out, path)
-        os.makedirs(os.path.dirname(dst) or out, exist_ok=True)
-        with open(dst, "wb") as fh:
-            fh.write(data)
-        if wanted[path]["mode"] == "100755":
-            os.chmod(dst, 0o755)
+        write_file(os.path.join(out, path), data, wanted[path]["mode"])
 
     failed, done = [], 0
     with concurrent.futures.ThreadPoolExecutor(DOWNLOADS) as pool:
@@ -266,11 +311,14 @@ def download(repo, commit, wanted, out, quiet=False):
 def cmd_ls(a):
     if not a.recursive:
         for p in a.paths or ["/"]:
-            for i in list_dir(a.repo, p, a.ref):
+            entries = list_dir(a.repo, p, a.ref)
+            if not isinstance(entries, list) or not all(isinstance(i, dict) for i in entries):
+                raise McpError(f"{p} is a file, not a folder. Print it with `cat`.")
+            for i in entries:
                 print(f"{i['type']:<4}  {i['path']}{'/' if i['type'] == 'dir' else ''}")
         return
     skip = skip_set(a)
-    files = repo_files(a.repo, head_commit(a.repo, a.ref or "main"))
+    files = repo_files(a.repo, head_commit(a.repo, a.ref))
     for p in a.paths or ["/"]:
         for f in sorted(files):
             if under(f, p) and not skipped(f, skip):
@@ -285,7 +333,7 @@ def cmd_pull(a):
     """Copy files or folders from the repo into a local directory, keeping their paths."""
     out = os.path.abspath(a.out)
     skip = skip_set(a)
-    commit = head_commit(a.repo, a.ref or "main")
+    commit = head_commit(a.repo, a.ref)
     files = repo_files(a.repo, commit)
     wanted, unknown = {}, []
     for p in a.paths:
@@ -313,10 +361,20 @@ def git(work, *args):
     return subprocess.run(["git", "-C", work, *args], capture_output=True, text=True)
 
 
-def local_commit(work, message):
-    git(work, "add", "-A")
-    git(work, "-c", "user.name=gh-mcp", "-c", "user.email=gh-mcp@localhost", "commit", "-qm", message)
-    return git(work, "rev-parse", "HEAD").stdout.strip()
+def local_commit(work, message, paths):
+    """Commit these paths (present or deleted) to the local repository, and nothing else.
+
+    Paths are named one by one and forced, because a repo can hold files its own .gitignore
+    would leave out; they must be in the baseline or their changes would never show."""
+    listed = "\0".join(paths)
+    for args in (["add", "-f", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                 ["-c", "user.name=gh-mcp", "-c", "user.email=gh-mcp@localhost", "commit", "-q", "--allow-empty",
+                  "-m", message, "--pathspec-from-file=-", "--pathspec-file-nul"]):
+        # Literal: a path may contain characters such as "[" that git would otherwise read as a pattern.
+        done = subprocess.run(["git", "--literal-pathspecs", "-C", work, *args],
+                              input=listed, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise McpError(f"git {args[0]} failed in {work}: {done.stderr.strip()[:300]}")
 
 
 def work_folder(a):
@@ -328,9 +386,21 @@ def state_path(work):
 
 
 def save_state(work, repo, branch, commit, files):
+    """Record which commit the folder matches and each file's checksum and mode in it."""
     with open(state_path(work), "w", encoding="utf-8") as fh:
         json.dump({"repo": repo, "branch": branch, "commit": commit,
-                   "files": {p: e["sha"] for p, e in files.items()}}, fh)
+                   "files": {p: [e["sha"], e["mode"]] for p, e in files.items()}}, fh)
+
+
+def load_state(work, repo):
+    try:
+        with open(state_path(work), encoding="utf-8") as fh:
+            state = json.load(fh)
+    except OSError:
+        raise McpError(f"{work} was not made by `clone`.")
+    if state["repo"] != repo:
+        raise McpError(f"{work} is a copy of {state['repo']}, but the chosen repo is {repo}.")
+    return state
 
 
 def cmd_clone(a):
@@ -343,11 +413,14 @@ def cmd_clone(a):
         raise McpError(f"{work} is already a copy of a repo. Use `sync` to bring it up to date.")
     if os.path.isdir(os.path.join(work, ".git")):
         raise McpError(f"{work} already holds a git repository that this tool did not make. Choose another folder.")
+    if subprocess.run(["git", "--version"], capture_output=True).returncode != 0:
+        raise McpError("git is not installed; `clone` uses it for the local baseline.")
     commit = head_commit(a.repo, a.branch)
     files = repo_files(a.repo, commit)
+    name = a.branch or "the default branch"
     # After an interrupted run, files already fetched and intact are not fetched again.
     fetch = {f: e for f, e in files.items() if local_sha(os.path.join(work, f)) != e["sha"]}
-    print(f"{len(files)} files in {a.repo} at {a.branch} {commit[:10]}; fetching {len(fetch)}.", flush=True)
+    print(f"{len(files)} files in {a.repo} on {name} at {commit[:10]}; fetching {len(fetch)}.", flush=True)
     os.makedirs(work, exist_ok=True)
     failed = download(a.repo, commit, fetch, work)
     for f, err in failed:
@@ -357,7 +430,7 @@ def cmd_clone(a):
     git(work, "init", "-q")
     # Line endings stay exactly as they are in the repo, so checksums keep matching.
     git(work, "config", "core.autocrlf", "false")
-    local_commit(work, f"baseline: {a.repo} {a.branch} at {commit[:10]}")
+    local_commit(work, f"baseline: {a.repo} {name} at {commit[:10]}", sorted(files))
     save_state(work, a.repo, a.branch, commit, files)
     print(f"All {len(files)} files are in {work}, committed locally as a baseline.")
     print("That repository is local only: it has no remote. Send changes with `push`.")
@@ -370,24 +443,20 @@ def cmd_sync(a):
     session has also changed ends up holding the branch's version; each such file is listed, with
     the command that shows the session's version, which stays in the local history."""
     work = work_folder(a)
-    try:
-        with open(state_path(work), encoding="utf-8") as fh:
-            state = json.load(fh)
-    except OSError:
-        raise McpError(f"{work} was not made by `clone`.")
-    if state["repo"] != a.repo:
-        raise McpError(f"{work} is a copy of {state['repo']}, but the chosen repo is {a.repo}.")
-    branch, last, then = state["branch"], state["commit"], state["files"]
+    state = load_state(work, a.repo)
+    branch, last = state["branch"], state["commit"]
+    name = branch or "the default branch"
+    then = {p: tuple(v) for p, v in state["files"].items()}  # path: (checksum, mode)
     commit = head_commit(a.repo, branch)
     if commit == last:
-        print(f"Already in step with {branch} ({commit[:10]}).")
+        print(f"Already in step with {name} ({commit[:10]}).")
         return
     if git(work, "status", "--porcelain").stdout.strip():
         raise McpError("there are uncommitted changes in the work folder, and sync overwrites files. "
                        "Commit them locally first (git add -A && git commit -m wip), then sync.")
 
     now = repo_files(a.repo, commit)
-    changed = {p: e for p, e in now.items() if then.get(p) != e["sha"]}
+    changed = {p: e for p, e in now.items() if then.get(p) != (e["sha"], e["mode"])}
     removed = sorted(set(then) - set(now))
     # What the session holds now, to tell its changes from the branch's.
     mine = {}
@@ -396,11 +465,11 @@ def cmd_sync(a):
             meta, path = line.split("\t", 1)
             mine[path] = meta.split()[2]
     before = git(work, "rev-parse", "HEAD").stdout.strip()
-    yours = {p for p in set(mine) | set(then) if mine.get(p) != then.get(p)}
+    yours = {p for p in set(mine) | set(then) if mine.get(p) != then.get(p, (None,))[0]}
     # Where both made the same change there is nothing to put back.
     both = sorted(p for p in yours & (set(changed) | set(removed)) if mine.get(p) != now.get(p, {}).get("sha"))
 
-    print(f"{branch} moved from {last[:10]} to {commit[:10]}: {len(changed)} file(s) to fetch, {len(removed)} to remove.")
+    print(f"{name} moved from {last[:10]} to {commit[:10]}: {len(changed)} file(s) to fetch, {len(removed)} to remove.")
     failed = download(a.repo, commit, changed, work, quiet=True)
     if failed:
         git(work, "checkout", "--", ".")
@@ -409,23 +478,42 @@ def cmd_sync(a):
             print(f"NOT FETCHED {f}: {err[:160]}", file=sys.stderr)
         raise McpError(f"{len(failed)} file(s) could not be fetched; the folder was put back as it was. Try again.")
     for p in removed:
-        if os.path.exists(os.path.join(work, p)):
+        if os.path.lexists(os.path.join(work, p)):
             os.remove(os.path.join(work, p))
     for p in sorted(changed):
         print(f"  fetched {p}")
     for p in removed:
         print(f"  removed {p}")
-    local_commit(work, f"sync: {branch} at {commit[:10]}")
+    local_commit(work, f"sync: {name} at {commit[:10]}", sorted(changed) + removed)
     save_state(work, a.repo, branch, commit, now)
-    print(f"In step with {branch} at {commit[:10]}.")
+    print(f"In step with {name} at {commit[:10]}.")
     if both:
-        print(f"\nATTENTION: {branch} also changed {len(both)} file(s) that you had changed. They now hold the")
+        print(f"\nATTENTION: {name} also changed {len(both)} file(s) that you had changed. They now hold the")
         print("branch's version, and your changes to them are NOT in the work folder any more. Your version of")
         print(f"each is still in your local commit {before[:10]}. Compare, and put your change back by hand:")
         for p in both:
             print(f"    git diff {before[:10]} HEAD -- '{p}'")
     elif yours:
         print("None of the files you have changed were touched on the branch. Your changes are intact.")
+
+
+def cmd_status(a):
+    """What differs between a work folder and the branch commit it was last in step with: the files
+    a `push` would need to send, and those an `rm` would need to delete. No API request."""
+    work = work_folder(a)
+    state = load_state(work, a.repo)
+    then = {p: v[0] for p, v in state["files"].items()}
+    # Every file git would consider: tracked, or untracked and not ignored.
+    listed = git(work, "ls-files", "-z", "--cached", "--others", "--exclude-standard").stdout.split("\0")
+    here = {p for p in listed if p and os.path.lexists(os.path.join(work, p))}
+    added = sorted(here - set(then))
+    modified = sorted(p for p in here & set(then) if local_sha(os.path.join(work, p)) != then[p])
+    deleted = sorted(p for p in then if not os.path.lexists(os.path.join(work, p)))
+    for mark, paths in (("A", added), ("M", modified), ("D", deleted)):
+        for p in paths:
+            print(f"{mark}  {p}")
+    if not (added or modified or deleted):
+        print(f"Nothing differs from {state['branch'] or 'the default branch'} at {state['commit'][:10]}.")
 
 
 # ---------- writing ----------
@@ -437,8 +525,11 @@ def cmd_branch(a):
 
 def read_message(a):
     if a.message_file:
-        with open(a.message_file, encoding="utf-8") as fh:
-            return fh.read()
+        try:
+            with open(a.message_file, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as e:
+            raise McpError(f"{a.message_file}: {e.strerror}")
     if not a.message:
         raise McpError("give -m MESSAGE or -F FILE")
     return a.message
@@ -446,10 +537,23 @@ def read_message(a):
 
 def cmd_push(a):
     """Commit local files (paths relative to --root) to a branch in ONE commit."""
+    root = os.path.abspath(a.root)
     files = []
     for p in a.files:
-        with open(os.path.join(a.root, p), encoding="utf-8") as fh:
-            files.append({"path": p, "content": fh.read()})
+        full = os.path.abspath(os.path.join(root, p))
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        if rel.startswith("../"):
+            raise McpError(f"{p} is outside --root {root}")
+        if os.path.isdir(full):
+            raise McpError(f"{p} is a folder. Name the files; `status` lists what has changed.")
+        try:
+            # newline="" keeps each file's own line endings; the default would turn CRLF into LF.
+            with open(full, encoding="utf-8", newline="") as fh:
+                files.append({"path": rel, "content": fh.read()})
+        except UnicodeDecodeError:
+            raise McpError(f"{p} is not UTF-8 text. `push` sends text only; binary files must be committed another way.")
+        except OSError as e:
+            raise McpError(f"{p}: {e.strerror}. To delete a file on the branch, use `rm`.")
     call("push_files", {**split_repo(a.repo), "branch": a.branch, "message": read_message(a), "files": files})
     print(f"committed {len(files)} file(s) to {a.branch}")
 
@@ -484,8 +588,11 @@ def cmd_rm(a):
 
 
 def cmd_pr(a):
-    with open(a.body_file, encoding="utf-8") as fh:
-        body = fh.read()
+    try:
+        with open(a.body_file, encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as e:
+        raise McpError(f"{a.body_file}: {e.strerror}")
     res = text_json(call("create_pull_request", {**split_repo(a.repo), "title": a.title, "head": a.head,
                                                  "base": a.base, "body": body}))
     print(res.get("url", res) if isinstance(res, dict) else res)
@@ -516,7 +623,11 @@ def cmd_tools(a):
 
 
 def cmd_call(a):
-    content = call(a.tool, json.loads(a.args), toolsets=a.toolsets)
+    try:
+        args = json.loads(a.args)
+    except ValueError as e:
+        raise McpError(f"the arguments are not valid JSON: {e}")
+    content = call(a.tool, args, toolsets=a.toolsets)
     print(json.dumps(content, indent=1))
 
 
@@ -549,10 +660,13 @@ def main():
 
     s = sub.add_parser("clone", help="copy the whole repo into a work folder with a local git baseline")
     s.add_argument("dir", nargs="?", help="the work folder; default ~/work/NAME")
-    s.add_argument("--branch", default="main"); s.set_defaults(fn=cmd_clone)
+    s.add_argument("--branch", help="default: the repo's default branch"); s.set_defaults(fn=cmd_clone)
 
     s = sub.add_parser("sync", help="bring a work folder made by `clone` up to date with its branch")
     s.add_argument("dir", nargs="?", help="the work folder; default ~/work/NAME"); s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("status", help="what a work folder has changed since it matched its branch (no API request)")
+    s.add_argument("dir", nargs="?", help="the work folder; default ~/work/NAME"); s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("branch", help="create a branch"); s.add_argument("name")
     s.add_argument("--base", default="main"); s.set_defaults(fn=cmd_branch)
@@ -591,6 +705,9 @@ def main():
     except McpError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":
