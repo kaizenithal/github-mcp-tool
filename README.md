@@ -23,7 +23,7 @@ So the tool is built to make few requests, and a session should use it the same 
 | `sync` | 1 if nothing changed, 2 if something did |
 | `pull` | 2, whatever the number of files |
 | `ls -r` | 2 |
-| `cat` | 0 |
+| `cat`, `status` | 0 |
 | `ls` | 1 per folder named |
 | `use`, `branch`, `pr`, `runs`, `logs`, `call`, `tools` | 1 each |
 | `push` | 1 for the whole commit |
@@ -65,7 +65,7 @@ python3 ~/gh-mcp/gh_mcp.py clone
 Add what you want done after the pasted text.
 
 - `use` saves the repo in `~/.gh-mcp-repo` and checks the token can read it. Every later command acts on that repo.
-- `clone` copies every file on `main` into `~/work/NAME` and commits it to a local git repository there, so `git status` and `git diff` show what the session changes. A few hundred files take seconds. That repository has no remote and is never pushed.
+- `clone` copies every file on the repo's default branch into `~/work/NAME` and commits it to a local git repository there, so `git status` and `git diff` show what the session changes. A few hundred files take seconds. That repository has no remote and is never pushed.
 - This tool repo is public, so fetching it needs no token.
 - To run a version you have reviewed, add `--branch TAG` to the `git clone`, with a tag you created on this repo.
 
@@ -89,6 +89,7 @@ The examples write `gh` for `python3 ~/gh-mcp/gh_mcp.py`.
 | Show the chosen repo | `gh which` |
 | Copy the whole repo into a work folder | `gh clone` (or `gh clone ~/somewhere --branch dev`) |
 | Bring that folder up to date | `gh sync` |
+| List what the folder has changed | `gh status` |
 | List a folder | `gh ls src` |
 | List every file below a folder | `gh ls -r src` |
 | Print a file | `gh cat README.md` |
@@ -101,16 +102,18 @@ The examples write `gh` for `python3 ~/gh-mcp/gh_mcp.py`.
 | Failed CI job logs | `gh logs <run id>` |
 | Any server tool | `gh tools` · `gh call <tool> '<json args>'` |
 
-`ls`, `cat` and `pull` accept `--ref <branch or sha>`. `branch` and `pr` assume the base branch is `main`; pass `--base` if yours differs.
+`ls`, `cat` and `pull` accept `--ref <branch or sha>` and read the repo's default branch without it. `clone` takes `--branch`. `branch` and `pr` assume the base branch is `main`; pass `--base` if yours differs.
 
-### `clone` and `sync`
+### `clone`, `sync` and `status`
 
-`clone` is for the folder a session works in. `sync` brings it up to date with its branch by comparing checksums and fetching only the files that differ, so it takes seconds.
+`clone` is for the folder a session works in. `sync` brings it up to date with its branch by comparing checksums and fetching only the files that differ, so it takes seconds. `status` lists what the folder has changed since it last matched the branch: `A` added, `M` modified, `D` deleted. Those are the files a `push` needs to name, and the ones an `rm` needs to delete.
 
 - Run `sync` before cutting each branch, and again before opening a pull request if the work took a while. Other sessions and the owner merge while you work, and a copy does not follow them by itself.
 - `sync` refuses to run while there are uncommitted changes, because it overwrites files. Commit locally first; the local repository goes nowhere.
 - If the branch changed a file the session had also changed, that file ends up holding the branch's version. `sync` prints `ATTENTION` with each such file and the `git diff` command that shows the session's version, which is still in the local history. Put the change back by hand.
 - A `clone` that is interrupted can be run again; it fetches only what is missing.
+- `status` leaves out files the repo's `.gitignore` ignores, as `git status` does. It reads only the work folder, so it costs nothing.
+- The local repository holds exactly the repo's files, including any that the repo's own `.gitignore` would leave out, so a change to one of those still shows in `git diff`.
 
 ### `pull`
 
@@ -125,7 +128,7 @@ The examples write `gh` for `python3 ~/gh-mcp/gh_mcp.py`.
 1. `gh sync`, so the work folder matches the latest `main`.
 2. Make the change. Build and run the project's tests, as its `HANDOFF.md` describes.
 3. Create a `claude/...` branch from `main`. A branch cut from an older `main` runs CI against old code.
-4. Push the changed files in one commit, then open the pull request. `git status --short -uall` in the work folder lists them. The description says what was run and what wasn't.
+4. Push the changed files in one commit, then open the pull request. `gh status` lists them. Leave out anything the project generates per machine. The description says what was run and what wasn't.
 5. Check `gh runs` once CI on the branch has had time to finish, before calling the pull request ready.
 6. Merge with **Squash and merge**.
 
@@ -133,7 +136,10 @@ The examples write `gh` for `python3 ~/gh-mcp/gh_mcp.py`.
 
 - **No `git clone` or `git push` of the project repo.** Reads and commits go through the two hosts above. The work folder's git repository is local only.
 - **Deletions take one commit and one request per file**, so large deletions are slow and noisy. That's why squash merging matters.
-- **`push` sends text only.** Files must be UTF-8 text; images and other binary files can't be committed this way.
+- **`push` sends text only.** Files must be UTF-8 text; images and other binary files can't be committed this way. Line endings are sent as they are.
+- **`push` commits ordinary files.** The server gives every file it commits the plain file mode, so a script pushed this way is not marked executable on GitHub, and a symbolic link becomes a file. Set those on GitHub or from a real clone.
+- **`push` adds and changes files; it does not delete.** Delete with `rm`.
+- **Submodules are not copied.** They are other repos.
 - **Every download is checked** against the file's git checksum and retried if it does not match. If a file can't be fetched, the command lists it and exits with an error.
 - **Very large repos.** GitHub cuts a listing short above about 100,000 files. The tool reports that instead of copying part of a repo.
 - **No tags or releases.** Create those on GitHub.
