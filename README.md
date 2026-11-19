@@ -112,6 +112,7 @@ The examples write `gh` for `python3 ~/gh-mcp/gh_mcp.py`.
 - `sync` refuses to run while there are uncommitted changes, because it overwrites files. Commit locally first; the local repository goes nowhere.
 - If the branch changed a file the session had also changed, that file ends up holding the branch's version. `sync` prints `ATTENTION` with each such file and the `git diff` command that shows the session's version, which is still in the local history. Put the change back by hand.
 - A `clone` that is interrupted can be run again; it fetches only what is missing.
+- `sync` copes with a folder that is already part of the way there: a file the branch deleted that the session had deleted too, a file the session already holds in the branch's new form, a file the branch turned into a folder or a folder into a file. If anything fails after it has started changing files, it puts the folder back as it was, so it can simply be run again.
 - `status` leaves out files the repo's `.gitignore` ignores, as `git status` does. It reads only the work folder, so it costs nothing.
 - The local repository holds exactly the repo's files, including any that the repo's own `.gitignore` would leave out, so a change to one of those still shows in `git diff`.
 
@@ -131,6 +132,10 @@ The examples write `gh` for `python3 ~/gh-mcp/gh_mcp.py`.
 4. Push the changed files in one commit, then open the pull request. `gh status` lists them. Leave out anything the project generates per machine. The description says what was run and what wasn't.
 5. Check `gh runs` once CI on the branch has had time to finish, before calling the pull request ready.
 6. Merge with **Squash and merge**.
+
+## Testing the tool
+
+`bash tests/sync_scenarios.sh` runs `clone`, `sync` and `status` through a dozen situations against a stand-in for GitHub (`tests/mock_github.py`): a folder on disk plays the branch. It needs no token and makes no requests. Run it after changing anything in `clone`, `sync`, `status` or the way files are written.
 
 ## Limits
 

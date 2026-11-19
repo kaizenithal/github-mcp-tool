@@ -274,6 +274,13 @@ def local_sha(path):
 def write_file(dst, data, mode):
     """Put a fetched file in place: whole or not at all, with git's executable bit and links kept."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.isdir(dst) and not os.path.islink(dst):
+        # A folder where the file should go. It is only removed if empty: `sync` empties a folder the
+        # branch has turned into a file before fetching, and anything else in it is not ours to delete.
+        try:
+            os.rmdir(dst)
+        except OSError:
+            raise McpError(f"{dst} is a folder that still has files in it, where the repo now has a file")
     if os.path.islink(dst) or mode == "120000":
         if os.path.lexists(dst):
             os.remove(dst)
@@ -366,15 +373,22 @@ def local_commit(work, message, paths):
 
     Paths are named one by one and forced, because a repo can hold files its own .gitignore
     would leave out; they must be in the baseline or their changes would never show."""
-    listed = "\0".join(paths)
-    for args in (["add", "-f", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                 ["-c", "user.name=gh-mcp", "-c", "user.email=gh-mcp@localhost", "commit", "-q", "--allow-empty",
-                  "-m", message, "--pathspec-from-file=-", "--pathspec-file-nul"]):
-        # Literal: a path may contain characters such as "[" that git would otherwise read as a pattern.
-        done = subprocess.run(["git", "--literal-pathspecs", "-C", work, *args],
-                              input=listed, capture_output=True, text=True)
-        if done.returncode != 0:
-            raise McpError(f"git {args[0]} failed in {work}: {done.stderr.strip()[:300]}")
+    # A path that is neither on disk nor in the index is nothing to git, and naming one is an error.
+    # That is a file the branch deleted which this folder had already deleted and committed.
+    tracked = set(git(work, "ls-files", "-z").stdout.split("\0"))
+    paths = [p for p in paths if p in tracked or os.path.lexists(os.path.join(work, p))]
+    # Literal: a path may contain characters such as "[" that git would otherwise read as a pattern.
+    added = subprocess.run(["git", "--literal-pathspecs", "-C", work, "add", "-f", "-A",
+                            "--pathspec-from-file=-", "--pathspec-file-nul"],
+                           input="\0".join(paths), capture_output=True, text=True)
+    if added.returncode != 0:
+        raise McpError(f"git add failed in {work}: {added.stderr.strip()[:300]}")
+    # Empty is allowed: the folder may already hold everything the branch changed.
+    # No paths on the commit: it takes what was just staged. Naming them fails when the branch has
+    # turned a file into a folder, because the old name is then a folder.
+    done = git(work, "-c", "user.name=gh-mcp", "-c", "user.email=gh-mcp@localhost", "commit", "-q", "--allow-empty", "-m", message)
+    if done.returncode != 0:
+        raise McpError(f"git commit failed in {work}: {(done.stderr or done.stdout).strip()[:300]}")
 
 
 def work_folder(a):
@@ -470,21 +484,39 @@ def cmd_sync(a):
     both = sorted(p for p in yours & (set(changed) | set(removed)) if mine.get(p) != now.get(p, {}).get("sha"))
 
     print(f"{name} moved from {last[:10]} to {commit[:10]}: {len(changed)} file(s) to fetch, {len(removed)} to remove.")
+
+    def put_back():
+        # The folder had nothing uncommitted when this started, so its last local commit is how it was.
+        git(work, "reset", "-q", "--hard", "HEAD")
+        git(work, "clean", "-fdq")
+
+    # Removals come first, with the folders they empty: the branch may have turned a file into a
+    # folder or a folder into a file, and the old one has to be out of the way of the new.
+    for p in removed:
+        full = os.path.join(work, p)
+        if os.path.lexists(full):
+            os.remove(full)
+        parent = os.path.dirname(full)
+        while parent != work and os.path.isdir(parent) and not os.listdir(parent):
+            os.rmdir(parent)
+            parent = os.path.dirname(parent)
     failed = download(a.repo, commit, changed, work, quiet=True)
     if failed:
-        git(work, "checkout", "--", ".")
-        git(work, "clean", "-fdq")
+        put_back()
         for f, err in failed:
             print(f"NOT FETCHED {f}: {err[:160]}", file=sys.stderr)
         raise McpError(f"{len(failed)} file(s) could not be fetched; the folder was put back as it was. Try again.")
-    for p in removed:
-        if os.path.lexists(os.path.join(work, p)):
-            os.remove(os.path.join(work, p))
     for p in sorted(changed):
         print(f"  fetched {p}")
     for p in removed:
         print(f"  removed {p}")
-    local_commit(work, f"sync: {name} at {commit[:10]}", sorted(changed) + removed)
+    try:
+        local_commit(work, f"sync: {name} at {commit[:10]}", sorted(changed) + removed)
+    except McpError:
+        # Left as it is, the folder would have the branch's changes uncommitted and the next sync
+        # would refuse to run.
+        put_back()
+        raise
     save_state(work, a.repo, branch, commit, now)
     print(f"In step with {name} at {commit[:10]}.")
     if both:
